@@ -3,11 +3,11 @@ import random
 import pymysql
 from faker import Faker
 from dotenv import load_dotenv
+from catalogo import CATALOGO, PAIS_MARCA
 
 load_dotenv()
 fake = Faker("es_ES")
 
-# Conexión a MySQL local
 conexion = pymysql.connect(
     host=os.getenv("MYSQL_HOST"),
     user=os.getenv("MYSQL_USER"),
@@ -16,54 +16,73 @@ conexion = pymysql.connect(
 )
 cursor = conexion.cursor()
 
-# Marcas
-marcas = [
-    ("Rolex", "Suiza"), ("Omega", "Suiza"), ("Patek Philippe", "Suiza"),
-    ("Audemars Piguet", "Suiza"), ("Cartier", "Francia"),
-    ("Seiko", "Japón"), ("TAG Heuer", "Suiza"), ("IWC", "Suiza"),
-]
-cursor.executemany("INSERT INTO marcas (nombre, pais) VALUES (%s, %s)", marcas)
+# Vaciar las tablas para empezar de cero
+cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+for tabla in ["pedidos", "anuncios", "compradores", "vendedores", "marcas"]:
+    cursor.execute(f"TRUNCATE TABLE {tabla}")
+cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
 
-# Vendedores (200)
+# Marcas
+ids_marca = {}
+for nombre in CATALOGO:
+    cursor.execute("INSERT INTO marcas (nombre, pais) VALUES (%s, %s)",
+                   (nombre, PAIS_MARCA[nombre]))
+    ids_marca[nombre] = cursor.lastrowid
+
+# Vendedores: particulares (personas) y profesionales (tiendas)
+paises_vendedor = ["España", "Alemania", "Italia", "Francia", "Suiza", "Países Bajos"]
 for _ in range(200):
+    tipo = random.choices(["particular", "profesional"], weights=[60, 40])[0]
+    if tipo == "particular":
+        nombre = fake.name()
+        correo = fake.unique.email()
+    else:
+        nombre = f"{random.choice(['Relojería', 'Joyería', 'Casa de Relojes'])} {fake.last_name()}"
+        correo = fake.unique.company_email()
     cursor.execute(
         "INSERT INTO vendedores (nombre, tipo_vendedor, pais, correo) VALUES (%s, %s, %s, %s)",
-        (fake.company(), random.choice(["particular", "profesional"]),
-         random.choice(["España", "Alemania", "Italia", "Francia"]),
-         fake.unique.email()),
+        (nombre, tipo, random.choice(paises_vendedor), correo),
     )
 
-# Compradores (1000)
+# Compradores
+paises_comprador = ["España", "México", "Colombia", "Argentina", "Chile", "Alemania"]
 for _ in range(1000):
     cursor.execute(
         "INSERT INTO compradores (nombre_completo, correo, pais) VALUES (%s, %s, %s)",
-        (fake.name(), fake.unique.email(),
-         random.choice(["España", "México", "Colombia", "Alemania"])),
+        (fake.name(), fake.unique.email(), random.choice(paises_comprador)),
     )
 
-# Anuncios (2000)
+# Anuncios: cada reloj es un modelo real con precio según su condición
+factor_condicion = {"nuevo": 1.0, "sin uso": 0.95, "muy bueno": 0.88, "bueno": 0.80, "usado": 0.70}
+anuncios = []  # (id_anuncio, fecha_publicacion)
 for _ in range(2000):
+    marca = random.choice(list(CATALOGO))
+    modelo, pmin, pmax, *_ = random.choice(CATALOGO[marca])
+    condicion = random.choices(list(factor_condicion), weights=[20, 10, 35, 25, 10])[0]
+    precio = round(random.uniform(pmin, pmax) * factor_condicion[condicion], -1)
+    fecha_pub = fake.date_time_between(start_date="-540d", end_date="-1d")
     cursor.execute(
-        "INSERT INTO anuncios (id_vendedor, id_marca, modelo, condicion, precio_eur) "
-        "VALUES (%s, %s, %s, %s, %s)",
-        (random.randint(1, 200), random.randint(1, 8),
-         f"Modelo {fake.bothify('??-###')}",
-         random.choice(["nuevo", "sin uso", "muy bueno", "bueno", "usado"]),
-         round(random.uniform(800, 60000), 2)),
+        "INSERT INTO anuncios (id_vendedor, id_marca, modelo, condicion, precio_eur, fecha_publicacion) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (random.randint(1, 200), ids_marca[marca], modelo, condicion, precio, fecha_pub),
     )
+    anuncios.append((cursor.lastrowid, fecha_pub))
 
-# Pedidos (800 anuncios vendidos)
-cursor.execute("SELECT id_anuncio, precio_eur FROM anuncios ORDER BY RAND() LIMIT 800")
-for id_anuncio, precio in cursor.fetchall():
+# Pedidos: 800 anuncios con compra, siempre después de su publicación
+for id_anuncio, fecha_pub in random.sample(anuncios, 800):
+    cursor.execute("SELECT precio_eur FROM anuncios WHERE id_anuncio = %s", (id_anuncio,))
+    precio = cursor.fetchone()[0]
+    estado = random.choices(["completado", "en_envio", "cancelado"], weights=[60, 20, 20])[0]
     cursor.execute(
         "INSERT INTO pedidos (id_anuncio, id_comprador, fecha_pedido, total_eur, comision_eur, estado) "
         "VALUES (%s, %s, %s, %s, %s, %s)",
         (id_anuncio, random.randint(1, 1000),
-         fake.date_time_between(start_date="-1y", end_date="now"),
-         precio, round(float(precio) * 0.065, 2),
-         random.choice(["completado", "completado", "completado", "en_envio", "cancelado"])),
+         fake.date_time_between(start_date=fecha_pub, end_date="now"),
+         precio, round(float(precio) * 0.065, 2), estado),
     )
-    cursor.execute("UPDATE anuncios SET estado = 'vendido' WHERE id_anuncio = %s", (id_anuncio,))
+    # Un pedido cancelado no vende el reloj
+    if estado != "cancelado":
+        cursor.execute("UPDATE anuncios SET estado = 'vendido' WHERE id_anuncio = %s", (id_anuncio,))
 
 conexion.commit()
 conexion.close()
